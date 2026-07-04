@@ -1,0 +1,16 @@
+[Unit]
+Description=Lightweight Power Monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%i
+WorkingDirectory=/home/%i/Projects/lightweight-power-monitor
+ExecStart=/usr/bin/python3 /home/%i/Projects/lightweight-power-monitor/power_monitor.py
+Restart=on-failure
+RestartSec=2
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
