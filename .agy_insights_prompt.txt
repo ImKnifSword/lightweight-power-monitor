@@ -1,0 +1,34 @@
+Edit /home/veno/Projects/lightweight-power-monitor/power_monitor.py and add these exact features, with minimal targeted edits. Do not add third-party dependencies.
+
+A) CONFIG additions:
+- 'alerts': [{'id':'high_watts','label':'High power draw','type':'watts','threshold':45,'sustain_s':30},{'id':'high_cpu','label':'High CPU load','type':'cpu','threshold':85,'sustain_s':15}]
+- 'alert_cooldown_s': 120
+- 'group_processes_by_basename': True
+
+B) Backend helpers:
+- class Alert: id, label, active, since, value
+- build_alerts() -> list[dict]: uses recent history within each alert sustain window.
+- group_processes_by_basename(procs): group by basename of cmdline argv0, sum watts/cpu, max memmory_mb, sort desc.
+- /api/alerts -> {'alerts': build_alerts(), 'generated_at': utc_now_iso()}
+- /api/processes honors group_processes_by_basename; response includes 'grouped': True if grouping enabled.
+
+C) Frontend:
+- Alert banner under header: red tone when active, click scrolls to overview.
+- Time range buttons: 1m | 10m | 30m | 1h -> refetch stats/history with matching window.
+- Relative time helper for Peaks/Processes updated text and footer updated.
+
+D) JS:
+- update() fetches /api/alerts and renders banner.
+- Refetch stats/history with selected window.
+- Wire segment buttons and show relative time.
+
+E) Validation commands to run in this workdir and paste exact output:
+- python3 -m py_compile power_monitor.py
+- python3 power_monitor.py &
+  sleep 3
+- curl -s http://localhost:5000/api/status
+- curl -s http://localhost:5000/api/config
+- curl -s http://localhost:5000/api/alerts
+- curl -s 'http://localhost:5000/api/stats/60'
+- curl -s http://localhost:5000/api/processes | head -c 400
+- curl -s http://localhost:5000/api/peaks | head -c 400
