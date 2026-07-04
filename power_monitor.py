@@ -25,6 +25,8 @@ CONFIG = {
     "history_max": 1800,
     "kwh_price": 0.65,
     "processes_top_n": 8,
+    "peaks_limit": 20,
+    "energy_history_limit": 600,
 }
 
 HISTORY_LOCK = threading.Lock()
@@ -407,32 +409,71 @@ class PowerMonitorHandler(BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
-        if self.path in ("/", "/index.html"):
+        path = self.path
+        query_params = {}
+        if "?" in path:
+            path, query_str = path.split("?", 1)
+            for pair in query_str.split("&"):
+                if "=" in pair:
+                    k, v = pair.split("=", 1)
+                    query_params[k] = v
+
+        if path in ("/", "/index.html"):
             return self.send_html()
-        if self.path == "/api/status":
+        if path == "/api/status":
             return self.send_json(status_payload())
-        if self.path == "/api/history":
-            return self.send_json({"history": history_snapshot(400)})
-        if self.path == "/api/config":
+        if path == "/api/history":
+            limit = CONFIG.get("energy_history_limit", 600)
+            if "limit" in query_params:
+                try:
+                    limit = int(query_params["limit"])
+                except ValueError:
+                    pass
+            limit = min(limit, CONFIG.get("energy_history_limit", 600))
+            return self.send_json({"history": history_snapshot(limit)})
+        if path == "/api/config":
             safe = {k: v for k, v in CONFIG.items() if k not in ("host", "port", "bind")}
             return self.send_json(safe)
-        if self.path.startswith("/api/stats/"):
-            seconds = min(900, max(10, int(self.path.rsplit("/", 1)[-1])))
+        if path.startswith("/api/stats/"):
+            seconds = min(900, max(10, int(path.rsplit("/", 1)[-1])))
             return self.send_json(window_stats(seconds))
-        if self.path == "/api/stats":
+        if path == "/api/stats":
             return self.send_json(window_stats(300))
-        if self.path == "/api/export.csv":
+        if path == "/api/export.csv":
             return self.send_csv()
-        if self.path == "/api/uptime":
+        if path == "/api/uptime":
             return self.send_json({"uptime_s": round(time.time() - _start_time, 1)})
-        if self.path == "/api/processes":
+        if path == "/api/processes":
+            limit = CONFIG.get("processes_top_n", 8)
+            if "limit" in query_params:
+                try:
+                    limit = int(query_params["limit"])
+                except ValueError:
+                    pass
+            limit = max(1, min(limit, 200))
+            
             with PROCESSES_LOCK:
-                data = {
-                    "processes": cached_processes,
-                    "generated_at": cached_processes_generated_at,
-                    "source": cached_processes_source
-                }
+                gen_at = cached_processes_generated_at
+                source = cached_processes_source
+            
+            procs = top_by_estimated_watts(limit)
+            
+            data = {
+                "processes": procs,
+                "generated_at": gen_at,
+                "source": source
+            }
             return self.send_json(data)
+        if path == "/api/peaks":
+            limit = CONFIG.get("peaks_limit", 20)
+            if "limit" in query_params:
+                try:
+                    limit = int(query_params["limit"])
+                except ValueError:
+                    pass
+            
+            peaks = get_peaks(limit)
+            return self.send_json({"peaks": peaks, "generated_at": utc_now_iso()})
         self.send_response(404)
         self.end_headers()
 
@@ -502,6 +543,54 @@ def window_stats(seconds: int) -> dict:
         "max_w": round(max(ws), 2),
         "avg_cpu": round(sum(cs) / len(cs), 1),
     }
+
+
+def get_top_processes(limit: int) -> list[dict]:
+    limit = min(limit, CONFIG.get("processes_top_n", 8))
+    with PROCESSES_LOCK:
+        sorted_procs = sorted(cached_processes, key=lambda x: x.get("estimated_watts", 0.0), reverse=True)
+        return sorted_procs[:limit]
+
+
+def get_top_peaks(limit: int) -> list[dict]:
+    limit = min(limit, CONFIG.get("peaks_limit", 20))
+    with HISTORY_LOCK:
+        samples = []
+        for s in history:
+            samples.append({
+                "ts": s["ts"],
+                "watts": s["watts"],
+                "cpu_load": s["cpu_load"],
+                "method": s["method"]
+            })
+        samples.sort(key=lambda s: (s["watts"], _parse_ts(s["ts"])), reverse=True)
+        return samples[:limit]
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def top_by_estimated_watts(limit: int) -> list[dict]:
+    limit = max(1, min(limit, 200))
+    with PROCESSES_LOCK:
+        sorted_procs = sorted(cached_processes, key=lambda x: x.get("estimated_watts", 0.0), reverse=True)
+        return sorted_procs[:limit]
+
+
+def get_peaks(limit: int) -> list[dict]:
+    limit = max(1, min(limit, 200))
+    with HISTORY_LOCK:
+        samples = []
+        for s in history:
+            samples.append({
+                "ts": s["ts"],
+                "watts": s["watts"],
+                "cpu_load": s["cpu_load"],
+                "method": s["method"]
+            })
+        samples.sort(key=lambda s: (s["watts"], s["ts"]), reverse=True)
+        return samples[:limit]
 
 
 _last_status = {
@@ -661,6 +750,105 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   a { color: #2563eb; text-decoration: none; }
   a:hover { text-decoration: underline; }
   .small { font-size: 12px; color: #6b7280; }
+
+  /* Tabs Layout styling */
+  .tabs-container {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 16px;
+    border-bottom: 2px solid #e5e7eb;
+    padding-bottom: 8px;
+  }
+  .tab-btn {
+    background: none;
+    border: none;
+    padding: 8px 16px;
+    font-size: 14px;
+    font-weight: 600;
+    color: #6b7280;
+    cursor: pointer;
+    border-radius: 6px;
+    transition: all 0.2s ease;
+  }
+  .tab-btn:hover {
+    color: #2563eb;
+    background: rgba(37, 99, 235, 0.05);
+  }
+  .tab-btn.active {
+    color: #2563eb;
+    background: rgba(37, 99, 235, 0.1);
+    box-shadow: inset 0 -2px 0 #2563eb;
+  }
+  .tab-content {
+    display: none;
+  }
+  .tab-content.active {
+    display: block;
+    animation: fadeIn 0.3s ease;
+  }
+  @keyframes fadeIn {
+    from { opacity: 0; transform: translateY(4px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  /* Overview chips row styling */
+  .chips-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+    gap: 12px;
+    margin-bottom: 16px;
+  }
+  .chip {
+    background: #f8fafc;
+    border: 1px solid #e2e8f0;
+    border-radius: 10px;
+    padding: 10px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    transition: transform 0.2s, box-shadow 0.2s;
+  }
+  .chip:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05), 0 2px 4px -1px rgba(0,0,0,0.03);
+    border-color: #cbd5e1;
+  }
+  .chip-label {
+    font-size: 10px;
+    text-transform: uppercase;
+    color: #64748b;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+  }
+  .chip-value {
+    font-size: 15px;
+    font-weight: 700;
+    color: #0f172a;
+  }
+
+  /* Color accents for peak table values */
+  .accent-high-cpu {
+    color: #dc2626;
+    font-weight: 600;
+    background: #fee2e2;
+    padding: 2px 6px;
+    border-radius: 4px;
+  }
+  .accent-high-watts {
+    color: #ea580c;
+    font-weight: 600;
+    background: #ffedd5;
+    padding: 2px 6px;
+    border-radius: 4px;
+  }
+  .sortable:hover {
+    background: #f3f4f6;
+  }
+  .sort-icon {
+    margin-left: 4px;
+    font-size: 10px;
+    color: #2563eb;
+  }
 </style>
 </head>
 <body>
@@ -726,28 +914,115 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 </section>
 
 <section class="chart-wrap">
-  <div class="row" style="justify-content:space-between;align-items:center;margin-bottom:8px;">
-    <div><strong>Top processes</strong><span class="small" id="processes_source" style="margin-left: 8px;">source: estimated</span></div>
-    <div class="small" id="processes_updated">updated: —</div>
+  <div class="tabs-container">
+    <button class="tab-btn active" data-tab="overview">Overview</button>
+    <button class="tab-btn" data-tab="processes">Processes</button>
+    <button class="tab-btn" data-tab="peaks">Peaks</button>
   </div>
-  <div style="overflow-x:auto;">
-    <table class="proc-table">
-      <thead>
-        <tr>
-          <th style="width: 50px;">Rank</th>
-          <th>Name</th>
-          <th class="text-right" style="width: 100px;">Power</th>
-          <th class="text-right" style="width: 80px;">CPU %</th>
-          <th class="text-right" style="width: 100px;">Memory</th>
-          <th>Command Excerpt</th>
-        </tr>
-      </thead>
-      <tbody id="processes_table_body">
-        <tr>
-          <td colspan="6" style="text-align: center; color: #6b7280; padding: 16px;">Loading processes...</td>
-        </tr>
-      </tbody>
-    </table>
+
+  <!-- Overview Tab Content -->
+  <div id="tab-overview" class="tab-content active">
+    <div class="chips-grid">
+      <div class="chip">
+        <span class="chip-label">Source</span>
+        <span class="chip-value" id="chip_source">—</span>
+      </div>
+      <div class="chip">
+        <span class="chip-label">Samples</span>
+        <span class="chip-value" id="chip_samples">—</span>
+      </div>
+      <div class="chip">
+        <span class="chip-label">Avg Power</span>
+        <span class="chip-value" id="chip_avg_w">— W</span>
+      </div>
+      <div class="chip">
+        <span class="chip-label">Min Power</span>
+        <span class="chip-value" id="chip_min_w">— W</span>
+      </div>
+      <div class="chip">
+        <span class="chip-label">Max Power</span>
+        <span class="chip-value" id="chip_max_w">— W</span>
+      </div>
+      <div class="chip">
+        <span class="chip-label">Est. Daily</span>
+        <span class="chip-value" id="chip_est_daily">—</span>
+      </div>
+      <div class="chip">
+        <span class="chip-label">Est. Monthly</span>
+        <span class="chip-value" id="chip_est_monthly">—</span>
+      </div>
+      <div class="chip">
+        <span class="chip-label">Uptime</span>
+        <span class="chip-value" id="chip_uptime">—</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Processes Tab Content -->
+  <div id="tab-processes" class="tab-content">
+    <div class="row" style="justify-content:space-between;align-items:center;margin-bottom:8px; gap:8px;">
+      <div>
+        <strong>Top Processes Power (W)</strong>
+        <span class="small" id="processes_source" style="margin-left: 8px;">source: estimated</span>
+      </div>
+      <div class="small" id="processes_updated">updated: —</div>
+    </div>
+    
+    <div class="svg-chart-container" style="margin-bottom: 16px;">
+      <svg id="processes_svg_chart" width="100%" style="background:#ffffff; border: 1px solid #e5e7eb; border-radius: 8px; padding: 12px; margin-bottom: 16px;">
+        <defs>
+          <linearGradient id="barGradient" x1="0%" y1="0%" x2="100%" y2="0%">
+            <stop offset="0%" stop-color="#3b82f6" />
+            <stop offset="100%" stop-color="#2563eb" />
+          </linearGradient>
+        </defs>
+      </svg>
+    </div>
+
+    <div style="overflow-x:auto;">
+      <table class="proc-table" id="processes_table">
+        <thead>
+          <tr>
+            <th style="width: 50px;">Rank</th>
+            <th class="sortable" data-sort="name" style="cursor: pointer; user-select: none;">Name <span class="sort-icon"></span></th>
+            <th class="sortable text-right" data-sort="watts" style="width: 100px; cursor: pointer; user-select: none;">Power <span class="sort-icon">↓</span></th>
+            <th class="sortable text-right" data-sort="cpu" style="width: 80px; cursor: pointer; user-select: none;">CPU % <span class="sort-icon"></span></th>
+            <th class="sortable text-right" data-sort="mem" style="width: 100px; cursor: pointer; user-select: none;">Memory <span class="sort-icon"></span></th>
+            <th>Command Excerpt</th>
+          </tr>
+        </thead>
+        <tbody id="processes_table_body">
+          <tr>
+            <td colspan="6" style="text-align: center; color: #6b7280; padding: 16px;">Loading processes...</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Peaks Tab Content -->
+  <div id="tab-peaks" class="tab-content">
+    <div class="row" style="justify-content:space-between;align-items:center;margin-bottom:8px;">
+      <div><strong>Top High-Power Samples</strong></div>
+    </div>
+    <div style="overflow-x:auto;">
+      <table class="proc-table" id="peaks_table">
+        <thead>
+          <tr>
+            <th style="width: 50px;">#</th>
+            <th>Time</th>
+            <th class="text-right" style="width: 120px;">Power</th>
+            <th class="text-right" style="width: 100px;">CPU %</th>
+            <th>Method</th>
+          </tr>
+        </thead>
+        <tbody id="peaks_table_body">
+          <tr>
+            <td colspan="5" style="text-align: center; color: #6b7280; padding: 16px;">Loading peaks...</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
   </div>
 </section>
 
@@ -800,6 +1075,215 @@ const cpuChart = new Chart(cpuCtx, {
   }
 });
 
+// Tab Switching
+document.querySelectorAll('.tab-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+    
+    btn.classList.add('active');
+    const tabId = 'tab-' + btn.getAttribute('data-tab');
+    document.getElementById(tabId).classList.add('active');
+  });
+});
+
+let procSortField = 'watts';
+let procSortAsc = false;
+let lastFetchedProcesses = [];
+const HIGH_WATTS_THRESHOLD = 25;
+
+function sortProcesses(processes) {
+  if (!processes) return [];
+  const sorted = [...processes];
+  sorted.sort((a, b) => {
+    let valA, valB;
+    if (procSortField === 'name') {
+      valA = (a.name || '').toLowerCase();
+      valB = (b.name || '').toLowerCase();
+    } else if (procSortField === 'watts') {
+      valA = a.estimated_watts || 0;
+      valB = b.estimated_watts || 0;
+    } else if (procSortField === 'cpu') {
+      valA = a.cpu_pct || 0;
+      valB = b.cpu_pct || 0;
+    } else if (procSortField === 'mem') {
+      valA = a.memory_mb || 0;
+      valB = b.memory_mb || 0;
+    }
+    
+    if (valA < valB) return procSortAsc ? -1 : 1;
+    if (valA > valB) return procSortAsc ? 1 : -1;
+    return 0;
+  });
+  return sorted;
+}
+
+function updateSortHeaders() {
+  document.querySelectorAll('#processes_table th.sortable').forEach(th => {
+    const field = th.getAttribute('data-sort');
+    const iconSpan = th.querySelector('.sort-icon');
+    if (field === procSortField) {
+      iconSpan.textContent = procSortAsc ? ' ↑' : ' ↓';
+      th.style.color = '#2563eb';
+    } else {
+      iconSpan.textContent = '';
+      th.style.color = '';
+    }
+  });
+}
+
+document.querySelectorAll('#processes_table th.sortable').forEach(th => {
+  th.addEventListener('click', () => {
+    const field = th.getAttribute('data-sort');
+    if (procSortField === field) {
+      procSortAsc = !procSortAsc;
+    } else {
+      procSortField = field;
+      procSortAsc = false;
+    }
+    updateSortHeaders();
+    renderProcessesTable();
+  });
+});
+
+function renderProcessesTable() {
+  const tbody = document.getElementById('processes_table_body');
+  tbody.innerHTML = '';
+  
+  const sorted = sortProcesses(lastFetchedProcesses);
+  
+  if (sorted.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; color: #6b7280; padding: 16px;">No active processes found</td></tr>';
+    return;
+  }
+  
+  sorted.forEach((p, index) => {
+    const tr = document.createElement('tr');
+    
+    const tdRank = document.createElement('td');
+    tdRank.textContent = index + 1;
+    
+    const tdName = document.createElement('td');
+    tdName.style.fontWeight = '500';
+    tdName.textContent = p.name || '—';
+    
+    const tdWatts = document.createElement('td');
+    tdWatts.className = 'text-right';
+    tdWatts.textContent = fmt(p.estimated_watts, 2) + ' W';
+    
+    const tdCpu = document.createElement('td');
+    tdCpu.className = 'text-right';
+    tdCpu.textContent = fmt(p.cpu_pct, 1) + ' %';
+    
+    const tdMem = document.createElement('td');
+    tdMem.className = 'text-right';
+    tdMem.textContent = p.memory_mb != null ? fmt(p.memory_mb, 1) + ' MB' : '—';
+    
+    const tdCmd = document.createElement('td');
+    const cmdDiv = document.createElement('div');
+    cmdDiv.className = 'cmd-excerpt';
+    cmdDiv.title = p.cmdline || '';
+    cmdDiv.textContent = p.cmdline || '—';
+    tdCmd.appendChild(cmdDiv);
+    
+    tr.appendChild(tdRank);
+    tr.appendChild(tdName);
+    tr.appendChild(tdWatts);
+    tr.appendChild(tdCpu);
+    tr.appendChild(tdMem);
+    tr.appendChild(tdCmd);
+    
+    tbody.appendChild(tr);
+  });
+}
+
+function renderProcessesSvg(processes) {
+  const svg = document.getElementById('processes_svg_chart');
+  svg.innerHTML = '';
+  if (!processes || processes.length === 0) {
+    svg.style.display = 'none';
+    return;
+  }
+  svg.style.display = 'block';
+  
+  // Create linear gradient
+  const defs = document.createElementNS('http://www.w3.org/2000/svg', 'defs');
+  const gradient = document.createElementNS('http://www.w3.org/2000/svg', 'linearGradient');
+  gradient.setAttribute('id', 'barGradient');
+  gradient.setAttribute('x1', '0%');
+  gradient.setAttribute('y1', '0%');
+  gradient.setAttribute('x2', '100%');
+  gradient.setAttribute('y2', '0%');
+  
+  const stop1 = document.createElementNS('http://www.w3.org/2000/svg', 'stop');
+  stop1.setAttribute('offset', '0%');
+  stop1.setAttribute('stop-color', '#3b82f6');
+  
+  const stop2 = document.createElementNS('http://www.w3.org/2000/svg', 'stop');
+  stop2.setAttribute('offset', '100%');
+  stop2.setAttribute('stop-color', '#2563eb');
+  
+  gradient.appendChild(stop1);
+  gradient.appendChild(stop2);
+  defs.appendChild(gradient);
+  svg.appendChild(defs);
+  
+  const maxW = Math.max(...processes.map(p => p.estimated_watts || 0), 1);
+  const rowHeight = 22;
+  const gap = 8;
+  const labelWidth = 130;
+  const maxBarWidth = 380;
+  const valueOffset = 520;
+  
+  const totalHeight = processes.length * (rowHeight + gap) + 10;
+  svg.setAttribute('viewBox', `0 0 600 ${totalHeight}`);
+  
+  processes.forEach((p, i) => {
+    const y = 5 + i * (rowHeight + gap);
+    const wVal = p.estimated_watts || 0;
+    const pct = wVal / maxW;
+    const barWidth = Math.max(2, pct * maxBarWidth);
+    
+    const text = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+    text.setAttribute('x', '10');
+    text.setAttribute('y', y + 15);
+    text.setAttribute('fill', '#4b5563');
+    text.setAttribute('font-size', '12px');
+    text.setAttribute('font-weight', '600');
+    let displayName = p.name || '—';
+    if (displayName.length > 15) displayName = displayName.slice(0, 14) + '…';
+    text.textContent = displayName;
+    svg.appendChild(text);
+    
+    const bgRect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+    bgRect.setAttribute('x', labelWidth);
+    bgRect.setAttribute('y', y);
+    bgRect.setAttribute('width', maxBarWidth);
+    bgRect.setAttribute('height', rowHeight);
+    bgRect.setAttribute('fill', '#f3f4f6');
+    bgRect.setAttribute('rx', '4');
+    svg.appendChild(bgRect);
+    
+    const activeRect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+    activeRect.setAttribute('x', labelWidth);
+    activeRect.setAttribute('y', y);
+    activeRect.setAttribute('width', barWidth);
+    activeRect.setAttribute('height', rowHeight);
+    activeRect.setAttribute('fill', 'url(#barGradient)');
+    activeRect.setAttribute('rx', '4');
+    svg.appendChild(activeRect);
+    
+    const valText = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+    valText.setAttribute('x', valueOffset);
+    valText.setAttribute('y', y + 15);
+    valText.setAttribute('fill', '#111827');
+    valText.setAttribute('font-size', '12px');
+    valText.setAttribute('font-weight', '700');
+    valText.textContent = fmt(wVal, 2) + ' W';
+    svg.appendChild(valText);
+  });
+}
+
 async function fetchJSON(url) {
   const r = await fetch(url);
   if (!r.ok) throw new Error('HTTP ' + r.status);
@@ -819,6 +1303,10 @@ async function update() {
     document.getElementById('src').textContent = status.method ?? '—';
     document.getElementById('method').textContent = status.method ?? '—';
     document.getElementById('updated').textContent = status.updated ? new Date(status.updated).toLocaleString() : '—';
+    
+    document.getElementById('chip_source').textContent = status.method ?? '—';
+    document.getElementById('chip_est_daily').textContent = fmt(status.cost_daily, 2) + ' PLN';
+    document.getElementById('chip_est_monthly').textContent = fmt(status.cost_monthly, 2) + ' PLN';
   } catch (e) {
     console.warn('status failed', e);
   }
@@ -849,6 +1337,11 @@ async function update() {
     document.getElementById('cpu_avg').textContent = fmt(stats.avg_cpu, 0);
     document.getElementById('power_window').textContent = stats.window_s ? 'window: last ' + Math.floor(stats.window_s/60) + ' min' : '';
     document.getElementById('cpu_window').textContent = stats.window_s ? 'window: last ' + Math.floor(stats.window_s/60) + ' min' : '';
+    
+    document.getElementById('chip_samples').textContent = stats.samples ?? 0;
+    document.getElementById('chip_avg_w').textContent = fmt(stats.avg_w, 1) + ' W';
+    document.getElementById('chip_min_w').textContent = fmt(stats.min_w, 1) + ' W';
+    document.getElementById('chip_max_w').textContent = fmt(stats.max_w, 1) + ' W';
   } catch (e) {
     console.warn('stats failed', e);
   }
@@ -857,62 +1350,81 @@ async function update() {
     const s = Math.floor((u.uptime_s || 0));
     const mm = String(Math.floor(s/60)).padStart(2,'0');
     const ss = String(s%60).padStart(2,'0');
-    document.getElementById('uptime').textContent = mm + ':' + ss;
+    const timeStr = mm + ':' + ss;
+    document.getElementById('uptime').textContent = timeStr;
+    document.getElementById('chip_uptime').textContent = timeStr;
   } catch (e) {
     console.warn('uptime failed', e);
   }
   try {
     const procData = await fetchJSON('/api/processes');
-    document.getElementById('processes_source').textContent = 'source: ' + (procData.source ?? 'estimated');
+    const sourceEl = document.getElementById('processes_source');
+    if (sourceEl) sourceEl.textContent = 'source: ' + (procData.source ?? 'estimated');
     document.getElementById('processes_updated').textContent = procData.generated_at ? 'updated: ' + new Date(procData.generated_at).toLocaleTimeString() : 'updated: —';
     
-    const tbody = document.getElementById('processes_table_body');
+    lastFetchedProcesses = procData.processes || [];
+    renderProcessesTable();
+    updateSortHeaders();
+    
+    const topByPower = [...lastFetchedProcesses].sort((a, b) => (b.estimated_watts || 0) - (a.estimated_watts || 0)).slice(0, 8);
+    renderProcessesSvg(topByPower);
+  } catch (e) {
+    console.warn('processes failed', e);
+  }
+  try {
+    const peaksData = await fetchJSON('/api/peaks');
+    const tbody = document.getElementById('peaks_table_body');
     tbody.innerHTML = '';
     
-    if (!procData.processes || procData.processes.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; color: #6b7280; padding: 16px;">No active processes found</td></tr>';
+    const peaks = peaksData.peaks || [];
+    if (peaks.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="5" style="text-align: center; color: #6b7280; padding: 16px;">No peak data available</td></tr>';
     } else {
-      procData.processes.forEach((p, index) => {
+      peaks.forEach((s, index) => {
         const tr = document.createElement('tr');
         
-        const tdRank = document.createElement('td');
-        tdRank.textContent = index + 1;
+        const tdIndex = document.createElement('td');
+        tdIndex.textContent = index + 1;
         
-        const tdName = document.createElement('td');
-        tdName.style.fontWeight = '500';
-        tdName.textContent = p.name || '—';
+        const tdTime = document.createElement('td');
+        tdTime.textContent = s.ts ? new Date(s.ts).toLocaleTimeString() : '—';
         
         const tdWatts = document.createElement('td');
         tdWatts.className = 'text-right';
-        tdWatts.textContent = fmt(p.estimated_watts, 2) + ' W';
+        if (s.watts > HIGH_WATTS_THRESHOLD) {
+          const span = document.createElement('span');
+          span.className = 'accent-high-watts';
+          span.textContent = fmt(s.watts, 2) + ' W';
+          tdWatts.appendChild(span);
+        } else {
+          tdWatts.textContent = fmt(s.watts, 2) + ' W';
+        }
         
         const tdCpu = document.createElement('td');
         tdCpu.className = 'text-right';
-        tdCpu.textContent = fmt(p.cpu_pct, 1) + ' %';
+        if (s.cpu_load > 75) {
+          const span = document.createElement('span');
+          span.className = 'accent-high-cpu';
+          span.textContent = fmt(s.cpu_load, 1) + ' %';
+          tdCpu.appendChild(span);
+        } else {
+          tdCpu.textContent = fmt(s.cpu_load, 1) + ' %';
+        }
         
-        const tdMem = document.createElement('td');
-        tdMem.className = 'text-right';
-        tdMem.textContent = p.memory_mb != null ? fmt(p.memory_mb, 1) + ' MB' : '—';
+        const tdMethod = document.createElement('td');
+        tdMethod.textContent = s.method || '—';
         
-        const tdCmd = document.createElement('td');
-        const cmdDiv = document.createElement('div');
-        cmdDiv.className = 'cmd-excerpt';
-        cmdDiv.title = p.cmdline || '';
-        cmdDiv.textContent = p.cmdline || '—';
-        tdCmd.appendChild(cmdDiv);
-        
-        tr.appendChild(tdRank);
-        tr.appendChild(tdName);
+        tr.appendChild(tdIndex);
+        tr.appendChild(tdTime);
         tr.appendChild(tdWatts);
         tr.appendChild(tdCpu);
-        tr.appendChild(tdMem);
-        tr.appendChild(tdCmd);
+        tr.appendChild(tdMethod);
         
         tbody.appendChild(tr);
       });
     }
   } catch (e) {
-    console.warn('processes failed', e);
+    console.warn('peaks failed', e);
   }
 }
 update();
