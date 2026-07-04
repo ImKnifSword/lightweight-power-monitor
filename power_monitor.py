@@ -27,7 +27,140 @@ CONFIG = {
     "processes_top_n": 8,
     "peaks_limit": 20,
     "energy_history_limit": 600,
+    "alerts": [
+        {"id": "high_watts", "label": "High power draw", "type": "watts", "threshold": 45, "sustain_s": 30},
+        {"id": "high_cpu", "label": "High CPU load", "type": "cpu", "threshold": 85, "sustain_s": 15}
+    ],
+    "alert_cooldown_s": 120,
+    "group_processes_by_basename": True,
 }
+
+
+class Alert:
+    def __init__(self, id, label, active=False, since=None, value=None):
+        self.id = id
+        self.label = label
+        self.active = active
+        self.since = since
+        self.value = value
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "label": self.label,
+            "active": self.active,
+            "since": self.since,
+            "value": self.value,
+        }
+
+
+def build_alerts() -> list[dict]:
+    alerts_list = []
+    alerts_config = CONFIG.get("alerts", [])
+    with HISTORY_LOCK:
+        local_history = list(history)
+
+    for alert_conf in alerts_config:
+        alert_id = alert_conf.get("id")
+        label = alert_conf.get("label")
+        alert_type = alert_conf.get("type")
+        threshold = alert_conf.get("threshold", 0.0)
+        sustain_s = alert_conf.get("sustain_s", 0)
+
+        active = False
+        since = None
+        current_value = 0.0
+
+        if local_history:
+            exceeding = []
+            for s in reversed(local_history):
+                val = s.get("watts" if alert_type == "watts" else "cpu_load", 0.0)
+                try:
+                    val = float(val)
+                except Exception:
+                    val = 0.0
+
+                if alert_type == "cpu":
+                    val = min(100.0, max(0.0, val))
+                elif alert_type == "watts":
+                    val = max(0.0, val)
+
+                if val > threshold:
+                    exceeding.append((s, val))
+                else:
+                    break
+
+            if exceeding:
+                current_value = exceeding[0][1]
+                newest_ts = _parse_ts(exceeding[0][0]["ts"])
+                oldest_ts = _parse_ts(exceeding[-1][0]["ts"])
+                if (newest_ts - oldest_ts) >= sustain_s:
+                    active = True
+                    since = exceeding[-1][0]["ts"]
+            else:
+                latest_s = local_history[-1]
+                val = latest_s.get("watts" if alert_type == "watts" else "cpu_load", 0.0)
+                try:
+                    current_value = float(val)
+                except Exception:
+                    current_value = 0.0
+                if alert_type == "cpu":
+                    current_value = min(100.0, max(0.0, current_value))
+                elif alert_type == "watts":
+                    current_value = max(0.0, current_value)
+
+        alert_obj = Alert(alert_id, label, active=active, since=since, value=round(current_value, 2))
+        alerts_list.append(alert_obj.to_dict())
+
+    return alerts_list
+
+
+def group_processes_by_basename(procs: list[dict]) -> list[dict]:
+    grouped = {}
+    for p in procs:
+        cmdline = p.get("cmdline", "")
+        name = p.get("name", "")
+        tokens = cmdline.split()
+        argv0 = tokens[0] if tokens else name
+        basename = os.path.basename(argv0) if argv0 else name
+
+        if not basename:
+            basename = "unknown"
+
+        if basename not in grouped:
+            grouped[basename] = {
+                "name": basename,
+                "cmdline": cmdline,
+                "estimated_watts": 0.0,
+                "cpu_pct": 0.0,
+                "memory_mb": None,
+            }
+
+        g = grouped[basename]
+        g["estimated_watts"] += p.get("estimated_watts", 0.0)
+        g["cpu_pct"] += p.get("cpu_pct", 0.0)
+
+        mem = p.get("memory_mb")
+        if mem is not None:
+            if g["memory_mb"] is None:
+                g["memory_mb"] = mem
+            else:
+                g["memory_mb"] = max(g["memory_mb"], mem)
+
+    result = []
+    for basename, g in grouped.items():
+        res = {
+            "name": g["name"],
+            "cmdline": g["cmdline"],
+            "estimated_watts": round(g["estimated_watts"], 2),
+            "cpu_pct": round(g["cpu_pct"], 1),
+        }
+        if g["memory_mb"] is not None:
+            res["memory_mb"] = round(g["memory_mb"], 2)
+        result.append(res)
+
+    result.sort(key=lambda x: x.get("estimated_watts", 0.0), reverse=True)
+    return result
 
 HISTORY_LOCK = threading.Lock()
 history = []
@@ -327,8 +460,7 @@ def estimate_process_power() -> list[dict]:
     _prev_procs = {pid: p["cpu_time"] for pid, p in procs_2.items()}
     
     estimated_procs.sort(key=lambda x: x["estimated_watts"], reverse=True)
-    top_n = CONFIG.get("processes_top_n", 8)
-    return estimated_procs[:top_n]
+    return estimated_procs
 
 
 # ---------------------------------------------------------------------------
@@ -429,13 +561,15 @@ class PowerMonitorHandler(BaseHTTPRequestHandler):
                     limit = int(query_params["limit"])
                 except ValueError:
                     pass
-            limit = min(limit, CONFIG.get("energy_history_limit", 600))
+            limit = min(limit, CONFIG.get("history_max", 1800))
             return self.send_json({"history": history_snapshot(limit)})
         if path == "/api/config":
             safe = {k: v for k, v in CONFIG.items() if k not in ("host", "port", "bind")}
             return self.send_json(safe)
+        if path == "/api/alerts":
+            return self.send_json({"alerts": build_alerts(), "generated_at": utc_now_iso()})
         if path.startswith("/api/stats/"):
-            seconds = min(900, max(10, int(path.rsplit("/", 1)[-1])))
+            seconds = min(3600, max(10, int(path.rsplit("/", 1)[-1])))
             return self.send_json(window_stats(seconds))
         if path == "/api/stats":
             return self.send_json(window_stats(300))
@@ -451,18 +585,28 @@ class PowerMonitorHandler(BaseHTTPRequestHandler):
                 except ValueError:
                     pass
             limit = max(1, min(limit, 200))
-            
+
             with PROCESSES_LOCK:
                 gen_at = cached_processes_generated_at
                 source = cached_processes_source
-            
-            procs = top_by_estimated_watts(limit)
-            
+                procs = list(cached_processes)
+
+            grouped = False
+            if CONFIG.get("group_processes_by_basename", False):
+                procs = group_processes_by_basename(procs)
+                grouped = True
+            else:
+                procs = sorted(procs, key=lambda x: x.get("estimated_watts", 0.0), reverse=True)
+
+            procs = procs[:limit]
+
             data = {
                 "processes": procs,
                 "generated_at": gen_at,
                 "source": source
             }
+            if grouped:
+                data["grouped"] = True
             return self.send_json(data)
         if path == "/api/peaks":
             limit = CONFIG.get("peaks_limit", 20)
@@ -668,6 +812,47 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     color: #1f2937;
     margin: 0;
     padding: 16px;
+    padding-top: 48px; /* space for fixed banner */
+  }
+  .alert-banner {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    z-index: 9999;
+    text-align: center;
+    padding: 10px 16px;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background-color 0.3s, color 0.3s, border-color 0.3s;
+    background: #ecfdf5; /* light green */
+    color: #065f46;
+    border-bottom: 1px solid #a7f3d0;
+  }
+  .alert-banner.active {
+    background: #fee2e2; /* light red */
+    color: #991b1b;
+    border-bottom: 1px solid #fca5a5;
+  }
+  .seg-btn {
+    background: none;
+    border: none;
+    padding: 6px 12px;
+    font-size: 12px;
+    font-weight: 600;
+    color: #4b5563;
+    cursor: pointer;
+    border-radius: 6px;
+    transition: all 0.2s ease;
+  }
+  .seg-btn:hover {
+    color: #111827;
+  }
+  .seg-btn.active {
+    background: #ffffff;
+    color: #2563eb;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.1);
   }
   .proc-table {
     width: 100%;
@@ -852,6 +1037,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 </style>
 </head>
 <body>
+<div id="alert-banner" class="alert-banner">System Status: Normal</div>
 <header>
   <h1>⚡ Lightweight Power Monitor</h1>
   <span class="badge" id="method">loading method…</span>
@@ -912,6 +1098,17 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   </div>
   <canvas id="cpu_chart" aria-label="CPU load over time" role="img"></canvas>
 </section>
+
+<!-- Time Range Segment Control -->
+<div class="segment-wrap" style="display: flex; justify-content: flex-end; align-items: center; gap: 8px; margin-bottom: 12px; padding: 0 4px;">
+  <span class="small" style="font-weight: 600; color: #4b5563;">Time Range:</span>
+  <div class="segment-control" style="display: inline-flex; background: #e5e7eb; padding: 2px; border-radius: 8px;">
+    <button class="seg-btn" data-seconds="60">1m</button>
+    <button class="seg-btn active" data-seconds="600">10m</button>
+    <button class="seg-btn" data-seconds="1800">30m</button>
+    <button class="seg-btn" data-seconds="3600">1h</button>
+  </div>
+</div>
 
 <section class="chart-wrap">
   <div class="tabs-container">
@@ -1042,6 +1239,27 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 </script>
 <script>
 const REFRESH_MS = 3000;
+let selectedWindowSeconds = 600;
+
+function getRelativeTime(isoString) {
+  if (!isoString) return '—';
+  try {
+    const d = new Date(isoString);
+    const diffMs = Date.now() - d.getTime();
+    const diffSec = Math.max(0, Math.floor(diffMs / 1000));
+    if (diffSec < 5) return 'just now';
+    if (diffSec < 60) return diffSec + 's ago';
+    const diffMin = Math.floor(diffSec / 60);
+    if (diffMin < 60) return diffMin + 'm ago';
+    const diffHour = Math.floor(diffMin / 60);
+    if (diffHour < 24) return diffHour + 'h ago';
+    const diffDay = Math.floor(diffHour / 24);
+    return diffDay + 'd ago';
+  } catch (e) {
+    return '—';
+  }
+}
+
 function fmt(n, d=2) {
   if (n == null || isNaN(n)) return '—';
   if (Math.abs(n) < 1 && d < 3) d = 3;
@@ -1084,6 +1302,26 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
     btn.classList.add('active');
     const tabId = 'tab-' + btn.getAttribute('data-tab');
     document.getElementById(tabId).classList.add('active');
+  });
+});
+
+// Alert Banner Click Event
+document.getElementById('alert-banner').addEventListener('click', () => {
+  const tabBtn = document.querySelector('.tab-btn[data-tab="overview"]');
+  if (tabBtn) tabBtn.click();
+  const target = document.getElementById('tab-overview');
+  if (target) {
+    target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+
+// Segment Control Setup
+document.querySelectorAll('.seg-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.seg-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    selectedWindowSeconds = parseInt(btn.getAttribute('data-seconds'), 10);
+    update();
   });
 });
 
@@ -1292,6 +1530,21 @@ async function fetchJSON(url) {
 
 async function update() {
   try {
+    const alertsData = await fetchJSON('/api/alerts');
+    const banner = document.getElementById('alert-banner');
+    const activeAlerts = (alertsData.alerts || []).filter(a => a.active);
+    if (activeAlerts.length > 0) {
+      banner.classList.add('active');
+      const alertTexts = activeAlerts.map(a => `${a.label} (${getRelativeTime(a.since)})`);
+      banner.textContent = '⚠️ Active Alerts: ' + alertTexts.join(', ');
+    } else {
+      banner.classList.remove('active');
+      banner.textContent = 'System Status: Normal';
+    }
+  } catch (e) {
+    console.warn('alerts failed', e);
+  }
+  try {
     const status = await fetchJSON('/api/status');
     document.getElementById('power').textContent = fmt(status.watts, 1) + ' W';
     document.getElementById('energy').textContent = fmt(status.kwh, 3);
@@ -1302,7 +1555,10 @@ async function update() {
     document.getElementById('month').textContent = fmt(status.cost_monthly, 2);
     document.getElementById('src').textContent = status.method ?? '—';
     document.getElementById('method').textContent = status.method ?? '—';
-    document.getElementById('updated').textContent = status.updated ? new Date(status.updated).toLocaleString() : '—';
+    
+    const updatedTime = status.updated ? new Date(status.updated).toLocaleTimeString() : '—';
+    const updatedRel = status.updated ? getRelativeTime(status.updated) : '';
+    document.getElementById('updated').textContent = status.updated ? `${updatedTime} (${updatedRel})` : '—';
     
     document.getElementById('chip_source').textContent = status.method ?? '—';
     document.getElementById('chip_est_daily').textContent = fmt(status.cost_daily, 2) + ' PLN';
@@ -1311,12 +1567,12 @@ async function update() {
     console.warn('status failed', e);
   }
   try {
-    const h = await fetchJSON('/api/history');
+    const h = await fetchJSON(`/api/history?limit=${Math.floor(selectedWindowSeconds / 2)}`);
     labels.length = 0;
     data.length = 0;
     cpuLabels.length = 0;
     cpuData.length = 0;
-    for (const s of h.history.slice(-120)) {
+    for (const s of h.history) {
       const t = new Date(s.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
       labels.push(t);
       data.push(s.watts);
@@ -1329,7 +1585,7 @@ async function update() {
     console.warn('history failed', e);
   }
   try {
-    const stats = await fetchJSON('/api/stats/600');
+    const stats = await fetchJSON(`/api/stats/${selectedWindowSeconds}`);
     document.getElementById('stats_samples').textContent = 'samples: ' + (stats.samples ?? 0);
     document.getElementById('stats_avg').textContent = fmt(stats.avg_w, 1);
     document.getElementById('stats_min').textContent = fmt(stats.min_w, 1);
@@ -1360,7 +1616,7 @@ async function update() {
     const procData = await fetchJSON('/api/processes');
     const sourceEl = document.getElementById('processes_source');
     if (sourceEl) sourceEl.textContent = 'source: ' + (procData.source ?? 'estimated');
-    document.getElementById('processes_updated').textContent = procData.generated_at ? 'updated: ' + new Date(procData.generated_at).toLocaleTimeString() : 'updated: —';
+    document.getElementById('processes_updated').textContent = procData.generated_at ? 'updated: ' + getRelativeTime(procData.generated_at) : 'updated: —';
     
     lastFetchedProcesses = procData.processes || [];
     renderProcessesTable();
@@ -1387,7 +1643,8 @@ async function update() {
         tdIndex.textContent = index + 1;
         
         const tdTime = document.createElement('td');
-        tdTime.textContent = s.ts ? new Date(s.ts).toLocaleTimeString() : '—';
+        tdTime.textContent = s.ts ? getRelativeTime(s.ts) : '—';
+        tdTime.title = s.ts ? new Date(s.ts).toLocaleString() : '';
         
         const tdWatts = document.createElement('td');
         tdWatts.className = 'text-right';
